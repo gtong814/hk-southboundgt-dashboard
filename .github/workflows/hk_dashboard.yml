@@ -2,8 +2,8 @@ name: HK Southbound Quant Dashboard
 
 on:
   schedule:
-    - cron: '30 8 * * 1-5'   # 香港時間 16:30（港股收盤後自動更新）
-  workflow_dispatch:         # 允許手動一鍵執行
+    - cron: '30 8 * * 1-5'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -20,31 +20,23 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-
     steps:
-      - name: 下載程式碼
+      - name: Checkout
         uses: actions/checkout@v4
-
-      - name: 安裝 Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
-      - name: 安裝套件
-        run: |
-          pip install yfinance pandas akshare
-
-      - name: 執行港股通量化分析並生成網頁
+      - name: Install packages
+        run: pip install yfinance pandas akshare
+      - name: Run analysis
         env:
           STOCK_LIST: ${{ secrets.STOCK_LIST }}
-        run: |
-          python analyze.py
-
-      - name: 上傳網頁檔案
+        run: python analyze.py
+      - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: './public'
-
-      - name: 發佈到 GitHub Pages
+      - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
