@@ -11,7 +11,6 @@ from datetime import datetime, timezone, timedelta
 def get_all_southbound_tickers():
     tickers = set()
 
-    # 來源 A：港交所 (HKEX) 官方合資格股份名單
     hkex_urls = [
         "https://www.hkex.com.hk/chi/market/sec_tradinfo/stockconnect/EligibleStocks_c.htm",
         "https://www.hkex.com.hk/eng/market/sec_tradinfo/stockconnect/EligibleStocks.htm"
@@ -30,7 +29,6 @@ def get_all_southbound_tickers():
         except Exception:
             pass
 
-    # 來源 B：AkShare 港股通成分股介面
     try:
         df_ggt = ak.stock_hk_ggt_components_em()
         if not df_ggt.empty and "代码" in df_ggt.columns:
@@ -43,7 +41,6 @@ def get_all_southbound_tickers():
     except Exception:
         pass
 
-    # 來源 C：核心港股通保底清單（緊湊格式防止貼上截斷）
     raw_codes = (
         "0001,0002,0003,0005,0006,0011,0012,0016,0017,0019,0020,0027,0066,0101,0135,0144,0151,0168,0175,0177,"
         "0200,0241,0257,0267,0268,0270,0285,0288,0291,0293,0316,0322,0341,0354,0358,0384,0386,0388,0390,0425,"
@@ -68,11 +65,64 @@ def get_all_southbound_tickers():
             tickers.add(f"{c.strip()}.HK")
     return sorted(list(tickers))
 
-# 2. 下載大市基準 (2800.HK 盈富基金)
+# 2. Stan Weinstein Stage 1-4 週線階段判斷函數（基於 30 週均線與斜率）
+def classify_weinstein_stage(df_daily):
+    # 將日線轉換為週線（每週五收盤價）
+    weekly_close = df_daily["Close"].resample("W-FRI").last().dropna()
+    weekly_vol = df_daily["Volume"].resample("W-FRI").sum().dropna()
+
+    # 若上市不足 30 週，改用可用最長週線均線（最少 15 週）
+    win = 30 if len(weekly_close) >= 34 else max(15, len(weekly_close) - 4)
+    if len(weekly_close) < 19:
+        return "N/A", "數據不足", 0.0, 0.0, "badge-neutral"
+
+    wma30 = weekly_close.rolling(win).mean()
+    curr_w_close = float(weekly_close.iloc[-1])
+    prev_w_close = float(weekly_close.iloc[-2])
+    curr_wma = float(wma30.iloc[-1])
+    prev_wma_4w = float(wma30.iloc[-5])  # 4 週前的 30 週均線值
+
+    if curr_wma <= 0 or prev_wma_4w <= 0:
+        return "N/A", "數據不足", 0.0, 0.0, "badge-neutral"
+
+    # 30 週均線近 4 週斜率變化（%）與股價偏離 30 週線幅度（%）
+    wma_slope_pct = ((curr_wma - prev_wma_4w) / prev_wma_4w) * 100
+    dist_wma_pct = ((curr_w_close - curr_wma) / curr_wma) * 100
+
+    # 週成交量放大倍數
+    curr_w_vol = float(weekly_vol.iloc[-1])
+    avg_w_vol = float(weekly_vol.iloc[-5:-1].mean()) if len(weekly_vol) >= 5 else curr_w_vol
+    w_vol_ratio = curr_w_vol / avg_w_vol if avg_w_vol > 0 else 1.0
+
+    # Stage 2：上升推進期（股價在 30 週線之上，且 30 週線向上或剛轉折向上）
+    if curr_w_close > curr_wma and wma_slope_pct > 0.3:
+        if prev_w_close <= float(wma30.iloc[-2]) or (dist_wma_pct <= 8.0 and w_vol_ratio >= 1.3):
+            return "Stage 2A", "Stage 2A（放量突破上升期）", curr_wma, wma_slope_pct, "badge-bull"
+        return "Stage 2", "Stage 2（主升推進期）", curr_wma, wma_slope_pct, "badge-bull"
+
+    # Stage 4：下跌衰落期（股價在 30 週線之下，且 30 週線明顯向下）
+    if curr_w_close < curr_wma and wma_slope_pct < -0.3:
+        return "Stage 4", "Stage 4（空頭下跌期）", curr_wma, wma_slope_pct, "badge-bear"
+
+    # Stage 1 vs Stage 3：30 週線走平（斜率介於 -0.3% 至 +0.3%）
+    if abs(wma_slope_pct) <= 0.3 or (curr_w_close > curr_wma and wma_slope_pct <= 0.3) or (curr_w_close < curr_wma and wma_slope_pct >= -0.3):
+        # 判斷過去 26 週整體是從低位盤整（Stage 1）還是高位派發（Stage 3）
+        lookback = min(26, len(weekly_close) - 1)
+        past_price = float(weekly_close.iloc[-lookback])
+        half_year_ret = ((curr_w_close - past_price) / past_price) * 100 if past_price > 0 else 0.0
+
+        if half_year_ret > 15.0:
+            return "Stage 3", "Stage 3（高檔頭部派發期）", curr_wma, wma_slope_pct, "badge-warn"
+        else:
+            return "Stage 1", "Stage 1（底部橫行築底期）", curr_wma, wma_slope_pct, "badge-neutral"
+
+    return "Stage 1", "Stage 1（築底觀察期）", curr_wma, wma_slope_pct, "badge-neutral"
+
+# 3. 下載大市基準 (2800.HK 盈富基金)
 bench_ret_20d = 0.0
 bench_ret_60d = 0.0
 try:
-    bench_df = yf.download("2800.HK", period="4mo", interval="1d", progress=False, timeout=15)
+    bench_df = yf.download("2800.HK", period="1y", interval="1d", progress=False, timeout=15)
     if isinstance(bench_df.columns, pd.MultiIndex):
         bench_df.columns = bench_df.columns.get_level_values(0)
     bench_close = bench_df["Close"].dropna()
@@ -87,9 +137,9 @@ pinned_raw = os.environ.get("STOCK_LIST", "")
 pinned_tickers = [t.strip().upper() for t in pinned_raw.split(",") if t.strip()]
 
 all_tickers = sorted(list(set(get_all_southbound_tickers()) | set(pinned_tickers)))
-print(f"共載入 {len(all_tickers)} 隻港股通股份，開始極速批量掃描...")
+print(f"共載入 {len(all_tickers)} 隻港股通股份，開始 1 年期日線/週線掃描...")
 
-# 3. 分批下載日線數據並計算技術指標與 Relative Strength
+# 4. 分批下載 1 年日線數據（支援計算 30 週均線與 RS Rating）
 results = []
 batch_size = 100
 
@@ -98,12 +148,12 @@ for i in range(0, len(all_tickers), batch_size):
     try:
         data = yf.download(
             batch,
-            period="4mo",
+            period="1y",
             interval="1d",
             group_by="ticker",
             progress=False,
             threads=True,
-            timeout=15
+            timeout=20
         )
     except Exception:
         continue
@@ -115,7 +165,7 @@ for i in range(0, len(all_tickers), batch_size):
         try:
             df = data[ticker] if len(batch) > 1 else data
             df = df.dropna(subset=["Close"])
-            if df.empty or len(df) < 21:
+            if df.empty or len(df) < 30:
                 continue
 
             close = df["Close"]
@@ -129,9 +179,12 @@ for i in range(0, len(all_tickers), batch_size):
                 continue
             pct_change = ((last_close - prev_close) / prev_close) * 100
 
+            # 計算 Stan Weinstein Stage 1-4
+            stage_code, stage_label, wma30_val, wma_slope, stage_badge = classify_weinstein_stage(df)
+
+            # 計算 Relative Strength 超額報酬
             ret_20d = ((last_close - float(close.iloc[-21])) / float(close.iloc[-21])) * 100
             ret_60d = ((last_close - float(close.iloc[-61])) / float(close.iloc[-61])) * 100 if len(close) >= 61 else ret_20d
-
             rs_diff_20d = ret_20d - bench_ret_20d
             rs_diff_60d = ret_60d - bench_ret_60d
             rs_weighted_excess = (rs_diff_20d * 0.6) + (rs_diff_60d * 0.4)
@@ -158,6 +211,11 @@ for i in range(0, len(all_tickers), batch_size):
                 "is_pinned": ticker in pinned_tickers,
                 "last_close": last_close,
                 "pct_change": pct_change,
+                "stage_code": stage_code,
+                "stage_label": stage_label,
+                "stage_badge": stage_badge,
+                "wma30": wma30_val,
+                "wma_slope": wma_slope,
                 "ma5": ma5,
                 "ma20": ma20,
                 "ma60": ma60,
@@ -173,7 +231,7 @@ for i in range(0, len(all_tickers), batch_size):
             continue
     time.sleep(0.5)
 
-# 4. 計算全市場 RS Rating（1 至 99 百分位排名）與綜合評分
+# 5. 計算全市場 RS Rating（1 至 99 百分位）與整合 Weinstein Stage 評分
 if results:
     rs_series = pd.Series([r["rs_weighted_excess"] for r in results])
     rs_ranks = (rs_series.rank(pct=True) * 98 + 1).round().astype(int).tolist()
@@ -185,55 +243,66 @@ for item, rs_rating in zip(results, rs_ranks):
     score = 50
     signals = []
 
-    if item["last_close"] > item["ma5"] > item["ma20"] > item["ma60"]:
-        score += 20
-        trend_status = "🚀 強勢多頭排列"
-        signals.append("股價企穩主要均線之上，呈現標準多頭排列。")
-    elif item["last_close"] > item["ma20"] and item["ma20"] > item["ma60"]:
-        score += 12
-        trend_status = "📈 中線上升趨勢"
-        signals.append("股價守穩 20 天及 60 天線之上，中線趨勢向上。")
-    elif item["last_close"] > item["ma20"]:
-        score += 5
-        trend_status = "🔄 站上月線反彈"
-        signals.append("股價重上 20 天線，短線有轉強跡象。")
-    elif item["last_close"] < item["ma20"] and item["last_close"] < item["ma60"]:
-        score -= 18
-        trend_status = "⚠️ 空頭弱勢結構"
-        signals.append("受壓於 20 天及 60 天線之下，走勢偏弱。")
-    else:
-        trend_status = "➖ 區間震盪整理"
-        signals.append("均線交織，處於橫行整固階段。")
+    # Weinstein 階段加權
+    if item["stage_code"] == "Stage 2A":
+        score += 22
+        signals.append(f"處於 {item['stage_label']}，剛放量站上向上傾斜的 30 週線（{item['wma30']:.2f}）。")
+    elif item["stage_code"] == "Stage 2":
+        score += 18
+        signals.append(f"處於 {item['stage_label']}，股價穩守 30 週線（{item['wma30']:.2f}，4週斜率 {item['wma_slope']:+.2f}%）之上。")
+    elif item["stage_code"] == "Stage 1":
+        score += 2
+        signals.append(f"處於 {item['stage_label']}，30 週線（{item['wma30']:.2f}）趨平整理，等待放量突破轉入 Stage 2。")
+    elif item["stage_code"] == "Stage 3":
+        score -= 8
+        signals.append(f"處於 {item['stage_label']}，30 週線（{item['wma30']:.2f}）動能放緩，留意高檔派發風險。")
+    elif item["stage_code"] == "Stage 4":
+        score -= 20
+        signals.append(f"處於 {item['stage_label']}，受壓於向下傾斜的 30 週線（{item['wma30']:.2f}，4週斜率 {item['wma_slope']:+.2f}%）之下。")
 
+    # 日線均線排列輔助
+    if item["last_close"] > item["ma5"] > item["ma20"] > item["ma60"]:
+        score += 12
+        signals.append("日線呈現標準多頭排列。")
+    elif item["last_close"] < item["ma20"] and item["last_close"] < item["ma60"]:
+        score -= 10
+        signals.append("日線受壓於 20 天及 60 天線之下。")
+
+    # Relative Strength 評分
     if rs_rating >= 85:
-        score += 15
+        score += 12
         signals.append(f"相對強弱極強（RS Rating {rs_rating}，近20日跑贏大市 {item['rs_diff_20d']:+.1f}%）。")
     elif rs_rating >= 70:
-        score += 8
-        signals.append(f"相對強弱跑贏大市（RS Rating {rs_rating}，近20日超額 {item['rs_diff_20d']:+.1f}%）。")
+        score += 6
+        signals.append(f"相對強弱跑贏大市（RS Rating {rs_rating}）。")
     elif rs_rating <= 25:
-        score -= 10
-        signals.append(f"相對大市明顯偏弱（RS Rating {rs_rating}，近20日跑輸大市 {item['rs_diff_20d']:+.1f}%）。")
+        score -= 8
+        signals.append(f"相對大市明顯偏弱（RS Rating {rs_rating}）。")
 
+    # 量能與 RSI
     if item["vol_ratio"] >= 1.5 and item["pct_change"] > 0:
-        score += 12
-        signals.append(f"放量上漲（量比 {item['vol_ratio']:.2f}x），買盤資金積極。")
+        score += 10
+        signals.append(f"日線放量上漲（量比 {item['vol_ratio']:.2f}x）。")
     elif item["vol_ratio"] >= 1.5 and item["pct_change"] < 0:
-        score -= 12
-        signals.append(f"放量下跌（量比 {item['vol_ratio']:.2f}x），沽壓較重。")
+        score -= 10
+        signals.append(f"日線放量下跌（量比 {item['vol_ratio']:.2f}x）。")
 
     if item["rsi14"] >= 75:
-        score -= 5
+        score -= 4
         signals.append(f"RSI(14) 達 {item['rsi14']:.1f}（超買區）。")
     elif item["rsi14"] <= 30:
-        score += 5
+        score += 4
         signals.append(f"RSI(14) 跌至 {item['rsi14']:.1f}（超賣區）。")
 
     item["score"] = max(0, min(100, score))
-    item["trend_status"] = trend_status
     item["signals"] = " ".join(signals)
 
-# 5. 排序與生成 HTML
+# 6. 排序與統計各 Stage 數量
+stage2_count = sum(1 for r in results if r["stage_code"] in ("Stage 2", "Stage 2A"))
+stage1_count = sum(1 for r in results if r["stage_code"] == "Stage 1")
+stage3_count = sum(1 for r in results if r["stage_code"] == "Stage 3")
+stage4_count = sum(1 for r in results if r["stage_code"] == "Stage 4")
+
 results.sort(key=lambda x: (x["is_pinned"], x["score"], x["rs_rating"]), reverse=True)
 
 summary_rows = []
@@ -255,6 +324,7 @@ for idx, item in enumerate(results):
       <td><strong>{pin_tag}{item['ticker']}</strong></td>
       <td>{item['last_close']:.2f}</td>
       <td class="{color_class}">{sign}{item['pct_change']:.2f}%</td>
+      <td><span class="badge {item['stage_badge']}">{item['stage_code']}</span> <span style="font-size:0.82em;color:#94a3b8;">(30W:{item['wma30']:.2f})</span></td>
       <td><span class="badge {rs_badge}">RS {item['rs_rating']}</span> <span class="{rs_diff_class}" style="font-size:0.85em;">({rs_sign}{item['rs_diff_20d']:.1f}%)</span></td>
       <td>{item['ma5']:.2f} / {item['ma20']:.2f} / {item['ma60']:.2f}</td>
       <td>{item['rsi14']:.1f}</td>
@@ -267,16 +337,17 @@ for idx, item in enumerate(results):
         detail_cards.append(f"""
         <div class="card">
           <div class="card-header">
-            <h3>{pin_tag}{item['ticker']} ｜ {item['trend_status']}</h3>
+            <h3>{pin_tag}{item['ticker']} ｜ {item['stage_label']}</h3>
             <div>
-              <span class="badge {rs_badge}" style="margin-right:6px;">RS Rating：{item['rs_rating']}</span>
+              <span class="badge {item['stage_badge']}" style="margin-right:6px;">{item['stage_code']}</span>
+              <span class="badge {rs_badge}" style="margin-right:6px;">RS：{item['rs_rating']}</span>
               <span class="badge {badge_class}">綜合評分：{item['score']} / 100</span>
             </div>
           </div>
           <ul>
-            <li><strong>技術面與強弱診斷：</strong>{item['signals']}</li>
-            <li><strong>相對大市表現 (vs 2800.HK)：</strong>近20日超額報酬 <code class="{rs_diff_class}">{rs_sign}{item['rs_diff_20d']:.2f}%</code> ｜ 近60日超額報酬 <code>{item['rs_diff_60d']:+.2f}%</code></li>
-            <li><strong>關鍵參考點位：</strong>20日阻力位 <code>{item['high_20d']:.2f}</code> ｜ 20日支撐位 <code>{item['low_20d']:.2f}</code> ｜ 月線(MA20) <code>{item['ma20']:.2f}</code></li>
+            <li><strong>Weinstein 階段與技術診斷：</strong>{item['signals']}</li>
+            <li><strong>週線與相對強弱：</strong>30週均線 <code>{item['wma30']:.2f}</code>（4週斜率 <code>{item['wma_slope']:+.2f}%</code>）｜ 近20日超額報酬 <code class="{rs_diff_class}">{rs_sign}{item['rs_diff_20d']:.2f}%</code></li>
+            <li><strong>日線關鍵點位：</strong>20日阻力位 <code>{item['high_20d']:.2f}</code> ｜ 20日支撐位 <code>{item['low_20d']:.2f}</code> ｜ 月線(MA20) <code>{item['ma20']:.2f}</code></li>
           </ul>
         </div>
         """)
@@ -290,14 +361,15 @@ html_output = f"""<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>全市場港股通量化決策儀表盤 (含 Relative Strength)</title>
+  <title>全市場港股通量化決策儀表盤 (Weinstein Stage 1-4 + RS)</title>
   <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft JhengHei", sans-serif; background: #0b1120; color: #e2e8f0; max-width: 1180px; margin: 0 auto; padding: 24px; line-height: 1.6; }}
+    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft JhengHei", sans-serif; background: #0b1120; color: #e2e8f0; max-width: 1240px; margin: 0 auto; padding: 24px; line-height: 1.6; }}
     h1 {{ color: #38bdf8; margin-bottom: 4px; }}
-    .meta {{ color: #94a3b8; font-size: 0.9em; margin-bottom: 24px; }}
+    .meta {{ color: #94a3b8; font-size: 0.9em; margin-bottom: 16px; }}
+    .stage-bar {{ display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 24px; background: #1e293b; padding: 12px 16px; border-radius: 8px; border: 1px solid #334155; font-size: 0.92em; }}
     .search-box {{ width: 100%; padding: 10px 14px; margin-bottom: 16px; border-radius: 8px; border: 1px solid #334155; background: #1e293b; color: #f8fafc; font-size: 1em; box-sizing: border-box; }}
-    table {{ width: 100%; border-collapse: collapse; margin-bottom: 28px; background: #1e293b; border-radius: 8px; overflow: hidden; font-size: 0.95em; }}
-    th, td {{ padding: 10px 12px; text-align: left; border-bottom: 1px solid #334155; }}
+    table {{ width: 100%; border-collapse: collapse; margin-bottom: 28px; background: #1e293b; border-radius: 8px; overflow: hidden; font-size: 0.92em; }}
+    th, td {{ padding: 10px 10px; text-align: left; border-bottom: 1px solid #334155; }}
     th {{ background: #0f172a; color: #38bdf8; font-weight: 600; position: sticky; top: 0; }}
     .up {{ color: #22c55e; font-weight: bold; }}
     .down {{ color: #ef4444; font-weight: bold; }}
@@ -305,9 +377,10 @@ html_output = f"""<!DOCTYPE html>
     .card {{ background: #1e293b; border-left: 4px solid #38bdf8; padding: 16px 20px; border-radius: 8px; margin-bottom: 16px; }}
     .card-header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; flex-wrap: wrap; gap: 8px; }}
     .card h3 {{ margin: 0; color: #f8fafc; }}
-    .badge {{ padding: 3px 10px; border-radius: 12px; font-size: 0.85em; font-weight: bold; display: inline-block; }}
+    .badge {{ padding: 3px 9px; border-radius: 12px; font-size: 0.83em; font-weight: bold; display: inline-block; }}
     .badge-bull {{ background: rgba(34, 197, 94, 0.2); color: #4ade80; border: 1px solid #22c55e; }}
     .badge-bear {{ background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid #ef4444; }}
+    .badge-warn {{ background: rgba(245, 158, 11, 0.2); color: #fbbf24; border: 1px solid #f59e0b; }}
     .badge-neutral {{ background: rgba(148, 163, 184, 0.2); color: #cbd5e1; border: 1px solid #64748b; }}
     code {{ background: #0f172a; padding: 2px 6px; border-radius: 4px; color: #38bdf8; }}
     ul {{ margin: 0; padding-left: 20px; }}
@@ -318,17 +391,26 @@ html_output = f"""<!DOCTYPE html>
   <h1>🇭🇰 全市場港股通量化掃描儀表盤</h1>
   <div class="meta">最後更新：{now_hkt} ｜ 已掃描港股通標的數：{len(results)} 隻 ｜ 基準 (2800.HK) 20日/60日表現：{bench_ret_20d:+.2f}% / {bench_ret_60d:+.2f}% ｜ 配色：綠升紅跌</div>
 
-  <h2>🔥 強勢多頭及重點置頂股診斷（綜合評分 ≥ 75 分）</h2>
-  {"".join(detail_cards) if detail_cards else "<p>今日暫無綜合評分達 75 分以上的強勢多頭標的。</p>"}
+  <div class="stage-bar">
+    <span><strong>📊 全市場 Stan Weinstein 階段分佈：</strong></span>
+    <span class="badge badge-bull">Stage 2 主升期：{stage2_count} 隻</span>
+    <span class="badge badge-neutral">Stage 1 築底期：{stage1_count} 隻</span>
+    <span class="badge badge-warn">Stage 3 派發期：{stage3_count} 隻</span>
+    <span class="badge badge-bear">Stage 4 下跌期：{stage4_count} 隻</span>
+  </div>
 
-  <h2>📊 全部港股通成分股量化總表（按綜合評分與 RS 強弱排列）</h2>
-  <input type="text" id="searchInput" class="search-box" onkeyup="filterTable()" placeholder="輸入股票代碼快速搜尋（例如：0700、9880、9660）...">
+  <h2>🔥 強勢 Stage 2 及重點置頂股診斷（綜合評分 ≥ 75 分）</h2>
+  {"".join(detail_cards) if detail_cards else "<p>今日暫無綜合評分達 75 分以上的強勢標的。</p>"}
+
+  <h2>📋 全部港股通成分股量化總表（支援搜尋代碼或 Stage 階段）</h2>
+  <input type="text" id="searchInput" class="search-box" onkeyup="filterTable()" placeholder="輸入股票代碼或階段篩選（例如：0700、Stage 2、Stage 2A、Stage 1）...">
   <table id="stockTable">
     <thead>
       <tr>
         <th>代碼</th>
-        <th>收盤價 (HKD)</th>
+        <th>收盤價</th>
         <th>漲跌幅</th>
+        <th>Weinstein 階段 (30週線)</th>
         <th>RS 評級 (20日超額)</th>
         <th>MA5 / MA20 / MA60</th>
         <th>RSI (14)</th>
@@ -346,11 +428,8 @@ html_output = f"""<!DOCTYPE html>
       const filter = document.getElementById("searchInput").value.toUpperCase();
       const rows = document.getElementById("stockTable").getElementsByTagName("tr");
       for (let i = 1; i < rows.length; i++) {{
-        const codeCell = rows[i].getElementsByTagName("td")[0];
-        if (codeCell) {{
-          const txt = codeCell.textContent || codeCell.innerText;
-          rows[i].style.display = txt.toUpperCase().indexOf(filter) > -1 ? "" : "none";
-        }}
+        const rowText = rows[i].textContent || rows[i].innerText;
+        rows[i].style.display = rowText.toUpperCase().indexOf(filter) > -1 ? "" : "none";
       }}
     }}
   </script>
