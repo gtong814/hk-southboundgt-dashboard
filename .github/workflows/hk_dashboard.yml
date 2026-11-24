@@ -1,0 +1,3 @@
+- name: 安裝套件
+        run: |
+          pip install yfinance pandas akshare
