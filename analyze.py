@@ -6,6 +6,8 @@ import akshare as ak
 import yfinance as yf
 import pandas as pd
 from datetime import datetime, timezone, timedelta
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
 
 # 1. 多源獲取完整港股通成分股名單
 def get_all_southbound_tickers():
@@ -67,11 +69,9 @@ def get_all_southbound_tickers():
 
 # 2. Stan Weinstein Stage 1-4 週線階段判斷函數（基於 30 週均線與斜率）
 def classify_weinstein_stage(df_daily):
-    # 將日線轉換為週線（每週五收盤價）
     weekly_close = df_daily["Close"].resample("W-FRI").last().dropna()
     weekly_vol = df_daily["Volume"].resample("W-FRI").sum().dropna()
 
-    # 若上市不足 30 週，改用可用最長週線均線（最少 15 週）
     win = 30 if len(weekly_close) >= 34 else max(15, len(weekly_close) - 4)
     if len(weekly_close) < 19:
         return "N/A", "數據不足", 0.0, 0.0, "badge-neutral"
@@ -80,33 +80,27 @@ def classify_weinstein_stage(df_daily):
     curr_w_close = float(weekly_close.iloc[-1])
     prev_w_close = float(weekly_close.iloc[-2])
     curr_wma = float(wma30.iloc[-1])
-    prev_wma_4w = float(wma30.iloc[-5])  # 4 週前的 30 週均線值
+    prev_wma_4w = float(wma30.iloc[-5])
 
     if curr_wma <= 0 or prev_wma_4w <= 0:
         return "N/A", "數據不足", 0.0, 0.0, "badge-neutral"
 
-    # 30 週均線近 4 週斜率變化（%）與股價偏離 30 週線幅度（%）
     wma_slope_pct = ((curr_wma - prev_wma_4w) / prev_wma_4w) * 100
     dist_wma_pct = ((curr_w_close - curr_wma) / curr_wma) * 100
 
-    # 週成交量放大倍數
     curr_w_vol = float(weekly_vol.iloc[-1])
     avg_w_vol = float(weekly_vol.iloc[-5:-1].mean()) if len(weekly_vol) >= 5 else curr_w_vol
     w_vol_ratio = curr_w_vol / avg_w_vol if avg_w_vol > 0 else 1.0
 
-    # Stage 2：上升推進期（股價在 30 週線之上，且 30 週線向上或剛轉折向上）
     if curr_w_close > curr_wma and wma_slope_pct > 0.3:
         if prev_w_close <= float(wma30.iloc[-2]) or (dist_wma_pct <= 8.0 and w_vol_ratio >= 1.3):
             return "Stage 2A", "Stage 2A（放量突破上升期）", curr_wma, wma_slope_pct, "badge-bull"
         return "Stage 2", "Stage 2（主升推進期）", curr_wma, wma_slope_pct, "badge-bull"
 
-    # Stage 4：下跌衰落期（股價在 30 週線之下，且 30 週線明顯向下）
     if curr_w_close < curr_wma and wma_slope_pct < -0.3:
         return "Stage 4", "Stage 4（空頭下跌期）", curr_wma, wma_slope_pct, "badge-bear"
 
-    # Stage 1 vs Stage 3：30 週線走平（斜率介於 -0.3% 至 +0.3%）
     if abs(wma_slope_pct) <= 0.3 or (curr_w_close > curr_wma and wma_slope_pct <= 0.3) or (curr_w_close < curr_wma and wma_slope_pct >= -0.3):
-        # 判斷過去 26 週整體是從低位盤整（Stage 1）還是高位派發（Stage 3）
         lookback = min(26, len(weekly_close) - 1)
         past_price = float(weekly_close.iloc[-lookback])
         half_year_ret = ((curr_w_close - past_price) / past_price) * 100 if past_price > 0 else 0.0
@@ -117,6 +111,62 @@ def classify_weinstein_stage(df_daily):
             return "Stage 1", "Stage 1（底部橫行築底期）", curr_wma, wma_slope_pct, "badge-neutral"
 
     return "Stage 1", "Stage 1（築底觀察期）", curr_wma, wma_slope_pct, "badge-neutral"
+
+# 新增：產出格式化 Excel 報表函數
+def export_to_excel(results_data, output_path):
+    rows = []
+    for r in results_data:
+        rows.append({
+            "代碼": r["ticker"],
+            "置頂": "是" if r["is_pinned"] else "",
+            "收盤價": round(r["last_close"], 2),
+            "漲跌幅(%)": round(r["pct_change"], 2),
+            "Weinstein階段": r["stage_code"],
+            "階段說明": r["stage_label"],
+            "30週均線": round(r["wma30"], 2),
+            "30週線4週斜率(%)": round(r["wma_slope"], 2),
+            "RS評級": r["rs_rating"],
+            "20日超額報酬(%)": round(r["rs_diff_20d"], 2),
+            "60日超額報酬(%)": round(r["rs_diff_60d"], 2),
+            "MA5": round(r["ma5"], 2),
+            "MA20": round(r["ma20"], 2),
+            "MA60": round(r["ma60"], 2),
+            "RSI(14)": round(r["rsi14"], 1),
+            "量比": round(r["vol_ratio"], 2),
+            "20日阻力位": round(r["high_20d"], 2),
+            "20日支撐位": round(r["low_20d"], 2),
+            "綜合評分": r["score"],
+            "技術診斷": r["signals"],
+        })
+
+    df_out = pd.DataFrame(rows)
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        df_out.to_excel(writer, index=False, sheet_name="港股通量化掃描")
+        ws = writer.sheets["港股通量化掃描"]
+
+        # 凍結首列 & 開啟自動篩選
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+
+        # 表頭樣式
+        header_fill = PatternFill(start_color="0F172A", end_color="0F172A", fill_type="solid")
+        header_font = Font(color="FFFFFF", bold=True)
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+        # 自動調整欄寬（限制上限避免診斷欄位過寬）
+        for col_idx, col_cells in enumerate(ws.columns, start=1):
+            max_len = 0
+            for cell in col_cells:
+                val = str(cell.value or "")
+                # 中文字元約佔 2 個寬度
+                display_len = sum(2 if ord(ch) > 127 else 1 for ch in val)
+                if display_len > max_len:
+                    max_len = display_len
+            col_letter = get_column_letter(col_idx)
+            ws.column_dimensions[col_letter].width = min(max_len + 4, 55)
 
 # 3. 下載大市基準 (2800.HK 盈富基金)
 bench_ret_20d = 0.0
@@ -139,7 +189,7 @@ pinned_tickers = [t.strip().upper() for t in pinned_raw.split(",") if t.strip()]
 all_tickers = sorted(list(set(get_all_southbound_tickers()) | set(pinned_tickers)))
 print(f"共載入 {len(all_tickers)} 隻港股通股份，開始 1 年期日線/週線掃描...")
 
-# 4. 分批下載 1 年日線數據（支援計算 30 週均線與 RS Rating）
+# 4. 分批下載 1 年日線數據
 results = []
 batch_size = 100
 
@@ -179,10 +229,8 @@ for i in range(0, len(all_tickers), batch_size):
                 continue
             pct_change = ((last_close - prev_close) / prev_close) * 100
 
-            # 計算 Stan Weinstein Stage 1-4
             stage_code, stage_label, wma30_val, wma_slope, stage_badge = classify_weinstein_stage(df)
 
-            # 計算 Relative Strength 超額報酬
             ret_20d = ((last_close - float(close.iloc[-21])) / float(close.iloc[-21])) * 100
             ret_60d = ((last_close - float(close.iloc[-61])) / float(close.iloc[-61])) * 100 if len(close) >= 61 else ret_20d
             rs_diff_20d = ret_20d - bench_ret_20d
@@ -231,7 +279,7 @@ for i in range(0, len(all_tickers), batch_size):
             continue
     time.sleep(0.5)
 
-# 5. 計算全市場 RS Rating（1 至 99 百分位）與整合 Weinstein Stage 評分
+# 5. 計算全市場 RS Rating 與整合 Weinstein Stage 評分
 if results:
     rs_series = pd.Series([r["rs_weighted_excess"] for r in results])
     rs_ranks = (rs_series.rank(pct=True) * 98 + 1).round().astype(int).tolist()
@@ -243,7 +291,6 @@ for item, rs_rating in zip(results, rs_ranks):
     score = 50
     signals = []
 
-    # Weinstein 階段加權
     if item["stage_code"] == "Stage 2A":
         score += 22
         signals.append(f"處於 {item['stage_label']}，剛放量站上向上傾斜的 30 週線（{item['wma30']:.2f}）。")
@@ -260,7 +307,6 @@ for item, rs_rating in zip(results, rs_ranks):
         score -= 20
         signals.append(f"處於 {item['stage_label']}，受壓於向下傾斜的 30 週線（{item['wma30']:.2f}，4週斜率 {item['wma_slope']:+.2f}%）之下。")
 
-    # 日線均線排列輔助
     if item["last_close"] > item["ma5"] > item["ma20"] > item["ma60"]:
         score += 12
         signals.append("日線呈現標準多頭排列。")
@@ -268,7 +314,6 @@ for item, rs_rating in zip(results, rs_ranks):
         score -= 10
         signals.append("日線受壓於 20 天及 60 天線之下。")
 
-    # Relative Strength 評分
     if rs_rating >= 85:
         score += 12
         signals.append(f"相對強弱極強（RS Rating {rs_rating}，近20日跑贏大市 {item['rs_diff_20d']:+.1f}%）。")
@@ -279,7 +324,6 @@ for item, rs_rating in zip(results, rs_ranks):
         score -= 8
         signals.append(f"相對大市明顯偏弱（RS Rating {rs_rating}）。")
 
-    # 量能與 RSI
     if item["vol_ratio"] >= 1.5 and item["pct_change"] > 0:
         score += 10
         signals.append(f"日線放量上漲（量比 {item['vol_ratio']:.2f}x）。")
@@ -297,13 +341,24 @@ for item, rs_rating in zip(results, rs_ranks):
     item["score"] = max(0, min(100, score))
     item["signals"] = " ".join(signals)
 
-# 6. 排序與統計各 Stage 數量
+# 6. 排序、統計與輸出檔案
 stage2_count = sum(1 for r in results if r["stage_code"] in ("Stage 2", "Stage 2A"))
 stage1_count = sum(1 for r in results if r["stage_code"] == "Stage 1")
 stage3_count = sum(1 for r in results if r["stage_code"] == "Stage 3")
 stage4_count = sum(1 for r in results if r["stage_code"] == "Stage 4")
 
 results.sort(key=lambda x: (x["is_pinned"], x["score"], x["rs_rating"]), reverse=True)
+
+os.makedirs("public", exist_ok=True)
+hkt = timezone(timedelta(hours=8))
+now_dt = datetime.now(hkt)
+now_hkt = now_dt.strftime("%Y-%m-%d %H:%M:%S HKT")
+today_str = now_dt.strftime("%Y%m%d")
+
+# 產出完整 Excel 報表
+excel_filename = "southbound_report.xlsx"
+export_to_excel(results, os.path.join("public", excel_filename))
+print(f"已產出 Excel 報表：public/{excel_filename}")
 
 summary_rows = []
 detail_cards = []
@@ -352,22 +407,24 @@ for idx, item in enumerate(results):
         </div>
         """)
 
-os.makedirs("public", exist_ok=True)
-hkt = timezone(timedelta(hours=8))
-now_hkt = datetime.now(hkt).strftime("%Y-%m-%d %H:%M:%S HKT")
-
 html_output = f"""<!DOCTYPE html>
 <html lang="zh-Hant">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>全市場港股通量化決策儀表盤 (Weinstein Stage 1-4 + RS)</title>
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
   <style>
     body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft JhengHei", sans-serif; background: #0b1120; color: #e2e8f0; max-width: 1240px; margin: 0 auto; padding: 24px; line-height: 1.6; }}
     h1 {{ color: #38bdf8; margin-bottom: 4px; }}
     .meta {{ color: #94a3b8; font-size: 0.9em; margin-bottom: 16px; }}
-    .stage-bar {{ display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 24px; background: #1e293b; padding: 12px 16px; border-radius: 8px; border: 1px solid #334155; font-size: 0.92em; }}
-    .search-box {{ width: 100%; padding: 10px 14px; margin-bottom: 16px; border-radius: 8px; border: 1px solid #334155; background: #1e293b; color: #f8fafc; font-size: 1em; box-sizing: border-box; }}
+    .stage-bar {{ display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-bottom: 24px; background: #1e293b; padding: 12px 16px; border-radius: 8px; border: 1px solid #334155; font-size: 0.92em; }}
+    .toolbar {{ display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; align-items: center; }}
+    .search-box {{ flex: 1; min-width: 240px; padding: 10px 14px; border-radius: 8px; border: 1px solid #334155; background: #1e293b; color: #f8fafc; font-size: 1em; box-sizing: border-box; }}
+    .btn {{ padding: 10px 16px; border-radius: 8px; font-size: 0.92em; font-weight: 600; cursor: pointer; text-decoration: none; border: none; display: inline-flex; align-items: center; gap: 6px; transition: opacity 0.15s ease; white-space: nowrap; }}
+    .btn:hover {{ opacity: 0.88; }}
+    .btn-excel {{ background: #16a34a; color: #ffffff; }}
+    .btn-filter-excel {{ background: #0284c7; color: #ffffff; }}
     table {{ width: 100%; border-collapse: collapse; margin-bottom: 28px; background: #1e293b; border-radius: 8px; overflow: hidden; font-size: 0.92em; }}
     th, td {{ padding: 10px 10px; text-align: left; border-bottom: 1px solid #334155; }}
     th {{ background: #0f172a; color: #38bdf8; font-weight: 600; position: sticky; top: 0; }}
@@ -397,13 +454,17 @@ html_output = f"""<!DOCTYPE html>
     <span class="badge badge-neutral">Stage 1 築底期：{stage1_count} 隻</span>
     <span class="badge badge-warn">Stage 3 派發期：{stage3_count} 隻</span>
     <span class="badge badge-bear">Stage 4 下跌期：{stage4_count} 隻</span>
+    <a href="{excel_filename}" download="港股通量化掃描_{today_str}.xlsx" class="btn btn-excel" style="margin-left:auto;">📥 下載完整 Excel (.xlsx)</a>
   </div>
 
   <h2>🔥 強勢 Stage 2 及重點置頂股診斷（綜合評分 ≥ 75 分）</h2>
   {"".join(detail_cards) if detail_cards else "<p>今日暫無綜合評分達 75 分以上的強勢標的。</p>"}
 
   <h2>📋 全部港股通成分股量化總表（支援搜尋代碼或 Stage 階段）</h2>
-  <input type="text" id="searchInput" class="search-box" onkeyup="filterTable()" placeholder="輸入股票代碼或階段篩選（例如：0700、Stage 2、Stage 2A、Stage 1）...">
+  <div class="toolbar">
+    <input type="text" id="searchInput" class="search-box" onkeyup="filterTable()" placeholder="輸入股票代碼或階段篩選（例如：0700、Stage 2、Stage 2A、Stage 1）...">
+    <button type="button" class="btn btn-filter-excel" onclick="exportFilteredTable()">🔍 匯出目前篩選結果 (.xlsx)</button>
+  </div>
   <table id="stockTable">
     <thead>
       <tr>
@@ -431,6 +492,31 @@ html_output = f"""<!DOCTYPE html>
         const rowText = rows[i].textContent || rows[i].innerText;
         rows[i].style.display = rowText.toUpperCase().indexOf(filter) > -1 ? "" : "none";
       }}
+    }}
+
+    function exportFilteredTable() {{
+      if (typeof XLSX === "undefined") {{
+        alert("Excel 匯出套件載入失敗，請檢查網路連線或使用上方「下載完整 Excel」按鈕。");
+        return;
+      }}
+      const table = document.getElementById("stockTable");
+      const rows = table.querySelectorAll("tr");
+      const exportData = [];
+
+      rows.forEach((row, idx) => {{
+        if (idx === 0 || row.style.display !== "none") {{
+          const cells = Array.from(row.querySelectorAll("th, td")).map(c => c.innerText.trim());
+          exportData.push(cells);
+        }}
+      }});
+
+      const ws = XLSX.utils.aoa_to_sheet(exportData);
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "篩選結果");
+
+      const keyword = document.getElementById("searchInput").value.trim();
+      const suffix = keyword ? "_" + keyword.replace(/[^a-zA-Z0-9\u4e00-\u9fa5_-]/g, "") : "";
+      XLSX.writeFile(wb, "港股通篩選_{today_str}" + suffix + ".xlsx");
     }}
   </script>
 </body>
