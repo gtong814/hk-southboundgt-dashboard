@@ -32,10 +32,10 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install requests akshare yfinance pandas
 
       - name: Run analysis
-        run: python main.py
+        run: python analyze.py
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
