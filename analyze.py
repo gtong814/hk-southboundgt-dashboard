@@ -70,7 +70,8 @@ def get_all_southbound_tickers():
 # 2. Stan Weinstein Stage 1-4 週線階段判斷函數（基於 30 週均線與斜率）
 def classify_weinstein_stage(df_daily):
     weekly_close = df_daily["Close"].resample("W-FRI").last().dropna()
-    weekly_vol = df_daily["Volume"].resample("W-FRI").sum().dropna()
+    # 改用「每週日均成交量」，避免週一至週四因交易日不足導致量比失真
+    weekly_vol_mean = df_daily["Volume"].resample("W-FRI").mean().dropna()
 
     win = 30 if len(weekly_close) >= 34 else max(15, len(weekly_close) - 4)
     if len(weekly_close) < 19:
@@ -88,18 +89,26 @@ def classify_weinstein_stage(df_daily):
     wma_slope_pct = ((curr_wma - prev_wma_4w) / prev_wma_4w) * 100
     dist_wma_pct = ((curr_w_close - curr_wma) / curr_wma) * 100
 
-    curr_w_vol = float(weekly_vol.iloc[-1])
-    avg_w_vol = float(weekly_vol.iloc[-5:-1].mean()) if len(weekly_vol) >= 5 else curr_w_vol
+    curr_w_vol = float(weekly_vol_mean.iloc[-1])
+    avg_w_vol = float(weekly_vol_mean.iloc[-5:-1].mean()) if len(weekly_vol_mean) >= 5 else curr_w_vol
     w_vol_ratio = curr_w_vol / avg_w_vol if avg_w_vol > 0 else 1.0
 
+    # 取得日線 20 天均線，過濾仍在回調中的弱勢股
+    ma20_val = float(df_daily["Close"].rolling(20).mean().iloc[-1])
+
+    # Stage 2：上升推進期
     if curr_w_close > curr_wma and wma_slope_pct > 0.3:
-        if prev_w_close <= float(wma30.iloc[-2]) or (dist_wma_pct <= 8.0 and w_vol_ratio >= 1.3):
+        is_reclaim = prev_w_close <= float(wma30.iloc[-2])
+        # 真正的 Stage 2A：必須站上 20 天線、必須放量（>= 1.3x），且剛站回 30 週線或距離不遠
+        if curr_w_close > ma20_val and w_vol_ratio >= 1.3 and (is_reclaim or dist_wma_pct <= 8.0):
             return "Stage 2A", "Stage 2A（放量突破上升期）", curr_wma, wma_slope_pct, "badge-bull"
         return "Stage 2", "Stage 2（主升推進期）", curr_wma, wma_slope_pct, "badge-bull"
 
+    # Stage 4：下跌衰落期
     if curr_w_close < curr_wma and wma_slope_pct < -0.3:
         return "Stage 4", "Stage 4（空頭下跌期）", curr_wma, wma_slope_pct, "badge-bear"
 
+    # Stage 1 vs Stage 3
     if abs(wma_slope_pct) <= 0.3 or (curr_w_close > curr_wma and wma_slope_pct <= 0.3) or (curr_w_close < curr_wma and wma_slope_pct >= -0.3):
         lookback = min(26, len(weekly_close) - 1)
         past_price = float(weekly_close.iloc[-lookback])
