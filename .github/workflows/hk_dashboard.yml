@@ -2,7 +2,7 @@ name: HK Southbound Quant Dashboard
 
 on:
   schedule:
-    - cron: '30 8 * * 1-5'
+    - cron: '23 8 * * 1-5'
   workflow_dispatch:
 
 permissions:
